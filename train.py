@@ -69,69 +69,70 @@ class Trainer:
         self.criterion = CrossEntropyLoss(ignore_index=model.tokenizer.pad_token_id)
         self.use_wandb = use_wandb
         
+        # Add length penalty to loss
+        self.length_penalty_weight = 0.1
+        
         if use_wandb:
             wandb.init(project="image-captioning", entity="mateowilcke-mli")
             wandb.watch(model)
 
     # Training method - needs gradients
     def train_epoch(self, epoch: int):
-        self.model.train()  # Set model to training mode
+        self.model.train()
         total_loss = 0
         num_batches = len(self.train_loader)
         
         progress_bar = tqdm(self.train_loader, desc=f"Training Epoch {epoch}")
         
         for step, batch in enumerate(progress_bar):
-            # batch contains: images (B, C, H, W) and captions (B, num_captions, seq_len)
             images, captions = batch
             batch_size, num_captions, seq_len = captions.shape
             
             # Repeat each image for its captions
-            images = images.repeat_interleave(num_captions, dim=0)  # (B*num_captions, C, H, W)
-            captions = captions.view(-1, seq_len)  # (B*num_captions, seq_len)
+            images = images.repeat_interleave(num_captions, dim=0)
+            captions = captions.view(-1, seq_len)
             
             images = images.to(self.device)
             captions = captions.to(self.device)
             
             # Prepare inputs (shift right for teacher forcing)
-            input_captions = captions[:, :-1]  # all but last token
-            target_captions = captions[:, 1:]  # all but first token
+            input_captions = captions[:, :-1]
+            target_captions = captions[:, 1:]
             
             # Forward pass
             outputs = self.model(images, input_captions)
             
-            # Calculate loss
-            loss = self.criterion(
-                outputs.view(-1, outputs.size(-1)),
-                target_captions.view(-1)
+            # Calculate loss with length penalty
+            ce_loss = self.criterion(
+                outputs.reshape(-1, outputs.size(-1)),
+                target_captions.reshape(-1)
             )
+            
+            # Add length penalty to encourage shorter captions
+            caption_lengths = (target_captions != self.model.tokenizer.pad_token_id).sum(dim=1)
+            length_penalty = self.length_penalty_weight * (caption_lengths.float() / caption_lengths.size(0))
+            
+            loss = ce_loss + length_penalty.mean()
             
             # Scale loss for gradient accumulation
             loss = loss / self.gradient_accumulation_steps
             loss.backward()
             
             if (step + 1) % self.gradient_accumulation_steps == 0:
-                # Clip gradients to prevent explosion
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.max_grad_norm
                 )
-                
-                # Update weights using the optimizer
                 self.optimizer.step()
-                
-                # Update learning rate
                 self.scheduler.step()
-                
-                # Zero out gradients for next step
                 self.optimizer.zero_grad()
             
             total_loss += loss.item() * self.gradient_accumulation_steps
             
             # Update progress bar
             progress_bar.set_postfix({
-                "loss": total_loss / (step + 1),
-                "lr": self.scheduler.get_last_lr()[0]
+                "loss": f"{total_loss / (step + 1):.4f}",
+                "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"
             })
             
             if self.use_wandb:
@@ -167,8 +168,8 @@ class Trainer:
             
             outputs = self.model(images, input_captions)
             loss = self.criterion(
-                outputs.view(-1, outputs.size(-1)),
-                target_captions.view(-1)
+                outputs.reshape(-1, outputs.size(-1)),
+                target_captions.reshape(-1)
             )
             
             total_loss += loss.item()
@@ -206,19 +207,32 @@ class Trainer:
                 logger.info(f"Saved new best model with val_loss={val_loss:.4f}")
 
 def main():
-    # Initialize model and datasets
+    logger.info("Initializing model and datasets...")
     model = ImageCaptioningModel()
-    train_dataset = Flickr30kDataset(split="train")
-    val_dataset = Flickr30kDataset(split="val")
     
-    # Initialize trainer
+    dataset = Flickr30kDataset(
+        split="test",
+        tokenizer=model.tokenizer
+    )
+    
+    # Split dataset
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, 
+        [train_size, val_size]
+    )
+    
+    logger.info(f"Dataset sizes:")
+    logger.info(f"  Train: {len(train_dataset)}")
+    logger.info(f"  Val: {len(val_dataset)}")
+    
     trainer = Trainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset
     )
     
-    # Start training
     trainer.train()
 
 if __name__ == "__main__":

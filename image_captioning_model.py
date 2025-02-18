@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 from transformers import CLIPModel, CLIPTokenizer
-from .utils import PositionalEncoding, generate_modified_mask, process_captions
+from utils import PositionalEncoding, generate_modified_mask, process_captions, extend_padding_mask
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Decoder(nn.Module):
     def __init__(self, d_model, nhead, num_layers, dim_feedforward, dropout):
@@ -27,7 +30,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         
         # Self-attention layer
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
@@ -49,7 +52,8 @@ class DecoderLayer(nn.Module):
             key=x,
             value=x,
             attn_mask=mask,
-            key_padding_mask=padding_mask
+            key_padding_mask=padding_mask,
+            need_weights=False
         )[0]
         x = self.dropout1(x)
         x = self.norm1(x + _x)
@@ -66,8 +70,8 @@ class ImageCaptioningModel(nn.Module):
     def __init__(
         self,
         clip_model_name="openai/clip-vit-base-patch32",
-        max_length=77,  # CLIP's default max length
-        d_model=512,
+        max_length=77,
+        d_model=512,  # This matches CLIP's projected dimension
         nhead=8,
         num_decoder_layers=6,
         dim_feedforward=2048,
@@ -82,11 +86,16 @@ class ImageCaptioningModel(nn.Module):
         for param in self.clip.parameters():
             param.requires_grad = False
             
-        # Project image features to match transformer dimensions
-        self.image_projection = nn.Linear(
-            self.clip.config.vision_config.hidden_size,
-            d_model
-        )
+        # Add logging to check CLIP's output dimension
+        logger.info(f"\nCLIP Model Info:")
+        logger.info(f"Vision embedding dim: {self.clip.config.vision_config.hidden_size}")
+        logger.info(f"Text embedding dim: {self.clip.config.text_config.hidden_size}")
+        
+        # No need for projection since CLIP already outputs 512-dim features
+        # self.image_projection = nn.Linear(
+        #     self.clip.config.vision_config.hidden_size,
+        #     d_model
+        # )
         
         # Text embedding layer (using CLIP's vocab size)
         vocab_size = self.tokenizer.vocab_size
@@ -104,11 +113,14 @@ class ImageCaptioningModel(nn.Module):
         
         self.fc_out = nn.Linear(d_model, vocab_size)
         self.max_length = max_length
+        self.nhead = nhead  # Store number of heads
+        
+        # Add a length controller
+        self.length_controller = nn.Linear(d_model, 1)
 
     def forward(self, images, captions):
-        # Get image features and project them
+        # Get image features (already in correct dimension)
         image_features = self.clip.get_image_features(images)
-        image_features = self.image_projection(image_features)
         
         # Process captions and get attention mask
         captions, attention_mask = process_captions(self.tokenizer, captions, images.device, self.max_length)
@@ -125,9 +137,14 @@ class ImageCaptioningModel(nn.Module):
         # Add positional encoding
         sequence = self.positional_encoding(sequence)
         
-        # Create causal mask
+        # Create causal mask with batch size and number of heads
         seq_length = sequence.size(1)
-        causal_mask = generate_modified_mask(seq_length).to(sequence.device)
+        batch_size = sequence.size(0)
+        causal_mask = generate_modified_mask(seq_length, batch_size).to(sequence.device)
+        
+        # Extend padding mask to include image token
+        if attention_mask is not None:
+            attention_mask = extend_padding_mask(attention_mask, batch_size, images.device)
         
         # Pass through decoder
         decoder_output = self.decoder(
@@ -136,6 +153,12 @@ class ImageCaptioningModel(nn.Module):
             padding_mask=~attention_mask if attention_mask is not None else None
         )
         
-        # Remove image token from output and project to vocabulary
+        # Get output logits
         output = self.fc_out(decoder_output[:, 1:])
+        
+        # Add length control (matching dimensions)
+        length_logits = self.length_controller(decoder_output[:, 1:])  # Match the output size
+        length_weights = torch.sigmoid(length_logits)
+        output = output * length_weights  # Broadcasting will handle the last dimension
+        
         return output
